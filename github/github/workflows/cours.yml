@@ -1,0 +1,78 @@
+name: Cours PEA
+
+on:
+  schedule:
+    - cron: '*/10 7-16 * * 1-5'
+    - cron: '15 18 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cours
+  cancel-in-progress: false
+
+jobs:
+  cours:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recuperer les cours
+        run: |
+          python3 - <<'PY'
+          import json, re, time, urllib.request
+          html = open('index.html', encoding='utf-8').read()
+          tickers = sorted(set(re.findall(r"ticker:\s*'([A-Z0-9.\-]+)'", html)))
+          try:
+              old = json.load(open('quotes.json')).get('quotes', {})
+          except Exception:
+              old = {}
+          out = {'ts': int(time.time() * 1000), 'quotes': {}}
+          for t in tickers:
+              time.sleep(2)
+              for host in ('query2', 'query1', 'query2', 'query1'):
+                  url = 'https://%s.finance.yahoo.com/v8/finance/chart/%s?range=1mo&interval=1d' % (host, t)
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                      d = json.load(urllib.request.urlopen(req, timeout=20))
+                      r = d['chart']['result'][0]
+                      m = r['meta']
+                      ts = r.get('timestamp') or []
+                      cl = r['indicators']['quote'][0].get('close') or []
+                      closes = [[time.strftime('%Y-%m-%d', time.gmtime(ts[i] + 3600)), round(cl[i], 4)]
+                                for i in range(len(ts)) if cl[i] is not None]
+                      price = m.get('regularMarketPrice') or closes[-1][1]
+                      day = time.strftime('%Y-%m-%d', time.gmtime((m.get('regularMarketTime') or ts[-1]) + 3600))
+                      prev = None
+                      for c in reversed(closes):
+                          if c[0] < day:
+                              prev = c[1]; break
+                      if prev is None:
+                          prev = m.get('chartPreviousClose') or price
+                      if closes and closes[-1][0] == day:
+                          closes[-1][1] = price
+                      else:
+                          closes.append([day, price])
+                      out['quotes'][t] = {'price': price, 'prev': prev, 'day': day,
+                                          'closes': closes, 'ts': int((m.get('regularMarketTime') or time.time()) * 1000)}
+                      print(t, price, prev, day)
+                      break
+                  except Exception as e:
+                      print('Erreur', t, host, e)
+                      time.sleep(5)
+              if t not in out['quotes'] and t in old:
+                  out['quotes'][t] = old[t]
+          if not out['quotes']:
+              raise SystemExit('Aucun cours')
+          json.dump(out, open('quotes.json', 'w'), separators=(',', ':'))
+          PY
+
+      - name: Enregistrer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add quotes.json
+          git diff --cached --quiet || (git commit -m "Cours PEA" && git push)
