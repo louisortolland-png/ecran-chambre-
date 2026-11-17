@@ -815,44 +815,15 @@ svg { display: block; }
     save('news', news);
     renderNews();
   }
-  function parseRssXml(text) {
-    var items = [], doc, nodes, i;
-    try { doc = new DOMParser().parseFromString(text, 'text/xml'); } catch (e) { return items; }
-    nodes = doc.getElementsByTagName('item');
-    for (i = 0; i < nodes.length; i++) {
-      var tn = nodes[i].getElementsByTagName('title')[0];
-      var dn = nodes[i].getElementsByTagName('pubDate')[0];
-      if (!tn) continue;
-      items.push({ t: decodeEntities(tn.textContent), d: dn ? (Date.parse(dn.textContent) || 0) : 0 });
-    }
-    return items;
-  }
-  function getText(url, ok, fail) {
-    var done = false, xhr = new XMLHttpRequest();
-    var timer = setTimeout(function () { if (done) return; done = true; try { xhr.abort(); } catch (e) {} fail(); }, 20000);
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== 4 || done) return;
-      done = true; clearTimeout(timer);
-      if (xhr.status >= 200 && xhr.status < 300) ok(xhr.responseText); else fail();
-    };
-    try { xhr.open('GET', url, true); xhr.send(); } catch (e) { done = true; clearTimeout(timer); fail(); }
-  }
   function fetchNews() {
-    // 1) rss2json (renvoie du JSON, autorisé depuis une page web)
+    // rss2json lit le flux RSS et le renvoie en JSON (autorisé depuis une page web)
     getJSON('https://api.rss2json.com/v1/api.json?rss_url=' + encodeURIComponent(NEWS_FEED), function (d) {
-      if (!d || d.status !== 'ok' || !d.items || !d.items.length) { viaProxy(1); return; }
+      if (!d || d.status !== 'ok' || !d.items || !d.items.length) { newsFailed(); return; }
       var items = [], i;
       for (i = 0; i < d.items.length; i++) items.push({ t: decodeEntities(d.items[i].title), d: parseUTC(d.items[i].pubDate) });
       gotNews(items);
-    }, function () { viaProxy(1); });
-    // 2) sinon, flux RSS brut via un relais
-    function viaProxy(k) {
-      if (k >= SOURCES.length) { newsOffline = true; renderNews(); return; }
-      getText(SOURCES[k](NEWS_FEED), function (txt) {
-        var items = parseRssXml(txt);
-        if (items.length) gotNews(items); else viaProxy(k + 1);
-      }, function () { viaProxy(k + 1); });
-    }
+    }, newsFailed);
+    function newsFailed() { newsOffline = true; renderNews(); }
   }
   function renderNews() {
     if (!news || !news.items.length) {
@@ -887,78 +858,34 @@ svg { display: block; }
     ]
   };
 
-  // Les cours viennent de Yahoo Finance. Si la lecture directe est
-  // refusée par le navigateur, on passe par un relais public.
-  var SOURCES = [
-    function (u) { return u; },
-    function (u) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); },
-    function (u) { return 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u); }
+  // Les cours sont récupérés toutes les 10 min par GitHub (fichier
+  // .github/workflows/cours.yml) et rangés dans quotes.json.
+  var QUOTES_URLS = [
+    'https://raw.githubusercontent.com/louisortolland-png/ecran-chambre-/main/quotes.json',
+    'quotes.json'
   ];
-  var goodSource = load('peaSource', 0);
-  if (!(goodSource >= 0 && goodSource < SOURCES.length)) goodSource = 0;
 
-  var quotes = load('peaQuotes', {});   // { ticker: { price, prev, day, closes, ts } }
+  var quotes = load('peaQuotes2', {});   // { ticker: { price, prev, day, closes, ts } }
   var chart = null;                     // courbe de la valeur du PEA
   var peaOffline = false, peaBusy = false, peaLastTry = 0;
-
-  function parseYahoo(d) {
-    try {
-      var r = d.chart.result[0], m = r.meta;
-      var ts = r.timestamp || [], cl = r.indicators.quote[0].close || [];
-      var closes = [], i;
-      for (i = 0; i < ts.length; i++) {
-        if (typeof cl[i] === 'number') closes.push([toISO(new Date(ts[i] * 1000)), cl[i]]);
-      }
-      var price = typeof m.regularMarketPrice === 'number' ? m.regularMarketPrice : closes[closes.length - 1][1];
-      var day = toISO(new Date((m.regularMarketTime || ts[ts.length - 1]) * 1000));
-      // Clôture de la séance précédente
-      var prev = null;
-      for (i = closes.length - 1; i >= 0; i--) { if (closes[i][0] < day) { prev = closes[i][1]; break; } }
-      if (prev === null) prev = m.chartPreviousClose || price;
-      if (closes.length && closes[closes.length - 1][0] === day) closes[closes.length - 1][1] = price;
-      else closes.push([day, price]);
-      if (!(price > 0)) return null;
-      return { price: price, prev: prev, day: day, closes: closes, ts: Date.now() };
-    } catch (e) { return null; }
-  }
-
-  function fetchQuote(ticker, done) {
-    var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + ticker + '?range=1mo&interval=1d';
-    var idx = goodSource, tries = 0;
-    function next() {
-      tries++;
-      if (tries >= SOURCES.length) { done(null); return; }
-      idx = (idx + 1) % SOURCES.length;
-      attempt();
-    }
-    function attempt() {
-      getJSON(SOURCES[idx](url), function (d) {
-        var q = parseYahoo(d);
-        if (!q) { next(); return; }
-        if (idx !== goodSource) { goodSource = idx; save('peaSource', idx); }
-        done(q);
-      }, next);
-    }
-    attempt();
-  }
 
   function fetchPea() {
     if (peaBusy) return;
     peaBusy = true; peaLastTry = Date.now();
-    var left = PEA.lignes.length, failed = 0, i;
-    function one(ticker) {
-      fetchQuote(ticker, function (q) {
-        if (q) quotes[ticker] = q; else failed++;
-        left--;
-        if (left === 0) {
-          peaBusy = false;
-          peaOffline = failed > 0;
-          save('peaQuotes', quotes);
-          renderPea();
+    var bust = '?t=' + Math.floor(Date.now() / 60000);
+    function attempt(k) {
+      if (k >= QUOTES_URLS.length) { peaBusy = false; peaOffline = true; renderPea(); return; }
+      getJSON(QUOTES_URLS[k] + bust, function (d) {
+        if (!d || !d.quotes) { attempt(k + 1); return; }
+        for (var t in d.quotes) {
+          if (d.quotes.hasOwnProperty(t) && d.quotes[t] && d.quotes[t].price > 0) quotes[t] = d.quotes[t];
         }
-      });
+        peaBusy = false; peaOffline = false;
+        save('peaQuotes2', quotes);
+        renderPea();
+      }, function () { attempt(k + 1); });
     }
-    for (i = 0; i < PEA.lignes.length; i++) one(PEA.lignes[i].ticker);
+    attempt(0);
   }
 
   // Bourse de Paris : du lundi au vendredi, 9 h - 17 h 35
@@ -1006,9 +933,13 @@ svg { display: block; }
       }
     }
     setHTML($('pea-rows'), rows, true);
-    if (!have) {
+    if (have < PEA.lignes.length) {
+      // Pas de faux total : on attend d'avoir le cours de toutes les lignes
+      setHTML($('pea-price'), '— €', true);
+      setHTML($('pea-latent'), '&nbsp;', true);
       setHTML($('pea-day'), '<span class="faint" style="margin-left:0">' + (peaOffline ? 'Cours indisponibles' : 'Chargement…') + '</span>', true);
-      setHTML($('pea-foot'), updatedLabel(0, peaOffline), true);
+      setHTML($('pea-foot'), updatedLabel(oldest, peaOffline), true);
+      chart = null; drawSpark();
       return;
     }
     setHTML($('pea-price'), fmtMoney(total, 2));
